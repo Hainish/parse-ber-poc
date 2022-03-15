@@ -1,25 +1,58 @@
-use std::fmt::Write;
 use std::fs;
+use std::io;
 
-use cryptographic_message_syntax::SignedData;
-use openssl::x509::X509;
-use openssl::hash::MessageDigest;
+use cryptographic_message_syntax::{SignedData, SignerInfo};
 use x509_certificate::certificate::CapturedX509Certificate;
 
 fn main() {
-    print_cert_fingerprint("rsa-files/CIARANG.RSA");
-    print_cert_fingerprint("rsa-files/1.RSA");
+    verify_jar("signed-jars/f-droid.org.jar", "CIARANG");
+    verify_jar("signed-jars/apt.izzysoft.de.jar", "NEBO");
 }
 
-fn print_cert_fingerprint(file: &str){
-    let bytes = fs::read(file).unwrap();
-    let cert = SignedData::parse_ber(&bytes).unwrap().certificates().collect::<Vec<&CapturedX509Certificate>>()[0].clone();
-    let x509 = X509::from_der(&cert.encode_ber().unwrap()).unwrap();
-    let cert_fingerprint = x509.digest(MessageDigest::from_name("sha256").unwrap()).unwrap();
+fn verify_jar(jar_file: &str, file_prefix: &str){
+    println!("Verifying {}", jar_file);
+    let file = fs::File::open(jar_file).unwrap();
+    let temp_dir = tempfile::tempdir().unwrap();
+    match zip::ZipArchive::new(file) {
+        Ok(mut archive) => {
+            for i in 0..archive.len() {
+                let mut file = archive.by_index(i).unwrap();
+                let outpath = match file.enclosed_name() {
+                    Some(path) => temp_dir.path().join(path.to_owned()),
+                    None => continue,
+                };
+                if (&*file.name()).ends_with('/') {
+                    fs::create_dir_all(&outpath).unwrap();
+                } else {
+                    if let Some(p) = outpath.parent() {
+                        if !p.exists() {
+                            fs::create_dir_all(&p).unwrap();
+                        }
+                    }
+                    let mut outfile = fs::File::create(&outpath).unwrap();
+                    io::copy(&mut file, &mut outfile).unwrap();
+                }
 
-    let mut s = String::new();
-    for byte in cert_fingerprint.iter() {
-        write!(&mut s, "{:02X?}", byte).expect("Unable to write");
+                // Get and Set permissions
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+
+                    if let Some(mode) = file.unix_mode() {
+                    fs::set_permissions(&outpath, fs::Permissions::from_mode(mode)).unwrap();
+                    }
+                }
+            }
+        },
+        Err(_) => {
+            println!("F-Droid package index could not be extracted. Please try again.");
+            std::process::exit(1);
+        }
     }
-    println!("{}", s);
+    let bytes = fs::read(format!("{}/META-INF/{}.RSA", temp_dir.path().display(), file_prefix)).unwrap();
+    let signed_data = SignedData::parse_ber(&bytes).unwrap();
+    let cert = signed_data.certificates().collect::<Vec<&CapturedX509Certificate>>()[0].clone();
+    let signer_info = signed_data.signers().collect::<Vec<&SignerInfo>>()[0].clone();
+    let signed_file_data = fs::read(format!("{}/META-INF/{}.SF", temp_dir.path().display(), file_prefix)).unwrap();
+    println!("{}", cert.verify_signed_data(signed_file_data.clone(), signer_info.signature()).is_ok());
 }
